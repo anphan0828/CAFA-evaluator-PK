@@ -74,13 +74,16 @@ def compute_confusion_matrix(tau_arr, g, pred_matrix, toi, n_gt, ic_arr=None, B_
     return metrics, metrics_B_tau
 
 
-def compute_confusion_matrix_exclude(tau_arr, g_perprotein, pred_matrix, toi_perprotein, n_gt, ic_arr=None, B_ind = None):
+def compute_confusion_matrix_exclude(tau_arr, g_perprotein, pred_matrix, toi_perprotein, n_gt, eligible_rows, ic_arr=None, B_ind = None):
     """
     Perform the evaluation at the matrix level for all tau thresholds
     The calculation is
 
     Here, g is the full ground truth matrix without filtering terms of interest (toi).
     Instead,
+    eligible_rows marks proteins that still have at least one evaluable GT
+    annotation after the per-protein exclude set is removed. Coverage must
+    count predictions only for this same post-exclusion population.
     """
     # n, tp, fp, fn, pr, rc (fp = misinformation, fn = remaining uncertainty)
     metrics = np.zeros((len(tau_arr), 6), dtype='float')
@@ -115,8 +118,10 @@ def compute_confusion_matrix_exclude(tau_arr, g_perprotein, pred_matrix, toi_per
         test_intersection(n_intersection, n_pred, n_gt)
 
 
-        # Number of proteins with at least one term predicted with score >= tau
-        metrics[i, 0] = (n_pred > 0).sum()
+        # Coverage numerator: count only proteins that remain eligible after
+        # exclusion. Keep TP/FP/FN over the original PK prediction cells so
+        # predictions on ineligible proteins can still contribute FP/MI.
+        metrics[i, 0] = ((n_pred > 0) & eligible_rows).sum()
 
         # Sum of confusion matrices
         metrics[i, 1] = n_intersection.sum()  # TP
@@ -237,10 +242,17 @@ def compute_metrics(pred, gt_matrix, tau_arr, toi, gt_exclude=None, ic_arr=None,
         # The number of GT annotations per proteins will change to exclude the set from g_exclude
         # count_g = np.logical_and(np.logical_not(g_exclude), g)  # count terms in g only if they are not in exclude list
         n_gt = np.array([gpp.sum().item() for gpp in gt_perprotein])  # number of terms annotated in each protein
-        if np.any(n_gt==0):
-            print(f'Proteins with no annotations in TOI {np.count_nonzero(n_gt==0)}')
         if ic_arr is not None:
             n_gt = np.array([(gpp * ic_arr[tois]).sum().item() for gpp, tois in zip(gt_perprotein, toi_perprotein)])
+        if np.any(n_gt == 0):
+            metric_mode = 'IA-weighted' if ic_arr is not None else 'unweighted'
+            positive_ia_note = ' positive-IA' if ic_arr is not None else ''
+            logging.warning(
+                f'{metric_mode} evaluation: '
+                f'{np.count_nonzero(n_gt == 0)} proteins had ground-truth annotations before exclusion, '
+                f'(known-annotation exclusion and the terms-of-interest) but no evaluable{positive_ia_note} '
+                f'ground-truth annotations remained.'
+            )
     else:
         count_g = g
 
@@ -266,7 +278,13 @@ def compute_metrics(pred, gt_matrix, tau_arr, toi, gt_exclude=None, ic_arr=None,
                         metrics_B_tau[tau] = metrics_b
                 metrics_B = get_metrics_B(metrics_B_tau)
     else:
-        arg_lists = [[tau_arr, gt_perprotein, pred[gt_matrix[:,toi].sum(1)>0, :], toi_perprotein, n_gt, ic_arr, B_ind] for tau_arr in np.array_split(tau_arr, n_cpu)]
+        # These rows define the post-exclusion evaluation population. The PK
+        # coverage denominator in evaluate_prediction is based on this same
+        # predicate, so the coverage numerator must use it too; otherwise
+        # proteins with all GT removed by gt_exclude can make cov/cov_w > 1
+        # when they still have above-threshold predictions.
+        eligible_rows = np.array([gpp.sum().item() > 0 for gpp in gt_perprotein])
+        arg_lists = [[tau_arr, gt_perprotein, pred[gt_matrix[:,toi].sum(1)>0, :], toi_perprotein, n_gt, eligible_rows, ic_arr, B_ind] for tau_arr in np.array_split(tau_arr, n_cpu)]
         with mp.Pool(processes=n_cpu) as pool:
             #metrics = np.concatenate(pool.starmap(compute_confusion_matrix_exclude, arg_lists), axis=0)
             results = pool.starmap(compute_confusion_matrix_exclude, arg_lists)
@@ -368,6 +386,7 @@ def evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude=None, no
         if ontologies[ns].ia is not None:
             # number of proteins with positive annotations
             proteins_has_gt = gt[ns].matrix[:, ontologies[ns].toi_ia].sum(1) > 0
+            proteins_with_gt = np.where(proteins_has_gt)[0]
             num_annot_prots = (proteins_has_gt).sum()
 
             if gt_exclude is None:
@@ -500,6 +519,4 @@ def write_results(df, dfs_best, metrics_B_df, out_dir='results', th_step=0.01):
 
     if isinstance(metrics_B_df, pd.DataFrame):
         metrics_B_df.to_csv('{}/Bootstrap_all.tsv'.format(out_folder), float_format="%.{}f".format(decimals), sep="\t")
-
-
 

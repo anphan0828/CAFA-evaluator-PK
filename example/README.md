@@ -12,6 +12,9 @@ illustrative purposess.
 To run the example,
 ``python3 /path/to/CAFA-evaluator/src/cafaeval/__main__.py go-sample.obo predictions ground_truth_partial.tsv -toi toi.tsv -known known_t0.tsv``
 
+To run the same example with IA-weighted metrics,
+``python3 /path/to/CAFA-evaluator/src/cafaeval/__main__.py go-sample.obo predictions ground_truth_partial.tsv -toi toi.tsv -known known_t0.tsv -ia ia_bug.tsv -out_dir results_fixcov``
+
 
 ## Known annotations
 
@@ -73,6 +76,25 @@ GO:0043056
 GO:0043057
 ``` 
 
+## Information Accretion and Weighted Evaluation
+
+Information accretion (IA) values can be supplied with the `-ia` option to compute weighted precision, recall, F-score, misinformation, remaining uncertainty, and S-score. Weighted columns in the output use the `_w` suffix, for example `pr_w`, `rc_w`, `f_w`, `mi_w`, `ru_w`, `s_w`, and `cov_w`.
+
+The IA file is a TSV file with two tab-separated columns (some GO terms IA are unrealistically set to zero as a minimal example to reproduce the bug):
+```
+GO:0040011	6.13
+GO:0032501	0.00
+GO:0033058	6.30
+GO:0031987	0.00
+GO:0071965	0.00
+GO:0043056	1.70
+GO:0043057	1.70
+GO:0008150	0.00
+GO:0050879	7.72
+```
+
+Only terms with positive IA are included in the weighted term set. In this toy example, `target2` remains eligible for the unweighted partial-knowledge evaluation after known annotations are excluded, but its remaining ground-truth terms (`GO:0031987` and `GO:0032501`) have IA 0. This makes `target2` useful for checking that weighted coverage is counted over the same post-exclusion eligible proteins as the weighted denominator.
+
 
 ## Example Prediction
 
@@ -92,3 +114,25 @@ or because they are previously known annotations.
 |   pred_1.tsv  |   biological_process  |   0.010  |   2.000  |   2.500  |   0.000  |   0.000  |   1.000  |   1.000  |   1.000  |   0.000  |   0.000  |   1.000  |   0.000  |   1.000     |   1.000     |   1.000    |   1.000    |
 |   pred_2.tsv  |   biological_process  |   0.010  |   2.000  |   2.500  |   0.000  |   0.000  |   1.000  |   1.000  |   1.000  |   0.000  |   0.000  |   1.000  |   0.000  |   1.000     |   1.000     |   1.000    |   1.000    |
 |               |                       |          |          |          |          |          |          |          |          |          |          |          |          |             |             |            |            |
+
+## Weighted Coverage Regression Example
+
+The `pred_3.tsv` file is a small regression fixture for the partial-knowledge weighted coverage calculation:
+```
+target1 GO:0043056 0.9999
+target2 GO:0043056 0.9999
+```
+
+With `ia_bug.tsv`, `target1` has positive-IA ground truth after exclusion and `target2` does not. The old coverage calculation counted both proteins in the weighted coverage numerator if they had a positive-IA prediction, but counted only `target1` in the weighted denominator. That produced `cov_w > 1`.
+
+Before the coverage fix, `pred_3.tsv` produced this invalid weighted coverage at `tau=0.01`:
+```
+filename    n    cov    n_w    cov_w
+pred_3.tsv  2.0  1.0    2.0    2.0
+```
+
+The fixed evaluator should keep regular coverage and weighted coverage bounded by 1. At `tau=0.01`, `pred_3.tsv` should produce:
+```
+filename    n    cov    n_w    cov_w
+pred_3.tsv  2.0  1.0    1.0    1.0
+```

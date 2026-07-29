@@ -196,7 +196,14 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
 
     with open(pred_file) as f:
         for line in f:
-            line = line.strip().split()
+            if ',' in line:
+                # Handle CSV files
+                line = line.strip().split(',')
+            elif '\t' in line:
+                # Handle TSV files
+                line = line.strip().split('\t')
+            else:
+                line = line.strip().split()
             if line and len(line) > 2:
                 p_id, term_id, prob = line[:3]
                 ns = ns_dict.get(term_id)
