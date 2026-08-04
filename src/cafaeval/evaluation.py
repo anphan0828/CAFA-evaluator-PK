@@ -1,9 +1,10 @@
 import os
+import random
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
 from cafaeval.parser import obo_parser, gt_parser, pred_parser, gt_exclude_parser, update_toi
-from cafaeval.tests import test_norm_metric, test_intersection
+from cafaeval.tests import test_norm_metric, test_intersection, test_bootstrap_metrics
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
@@ -132,7 +133,18 @@ def compute_confusion_matrix_exclude(tau_arr, g_perprotein, pred_matrix, toi_per
         metrics[i, 4] = np.divide(n_intersection, n_pred, out=np.zeros_like(n_intersection, dtype='float'), where=n_pred > 0).sum()  # Precision
         metrics[i, 5] = np.divide(n_intersection, n_gt, out=np.zeros_like(n_gt, dtype='float'), where=n_gt > 0).sum()  # Recall
 
-        metrics_per_protein = pd.DataFrame({'n_pred': n_pred, 'TP': n_intersection, 'FP': [m.sum() for m in mis], 'FN': [r.sum() for r in remaining], 'n_gt': n_gt})
+        metrics_per_protein = pd.DataFrame({
+            'n_pred': n_pred,
+            'TP': n_intersection,
+            'FP': [m.sum() for m in mis],
+            'FN': [r.sum() for r in remaining],
+            'n_gt': n_gt,
+            # Bootstrap coverage resamples proteins, so it needs the same
+            # post-exclusion eligibility predicate used by the main coverage
+            # numerator. Without carrying this mask into bootstrap, sampled
+            # rows whose GT was fully removed can inflate cov/cov_w.
+            'eligible': eligible_rows,
+        })
         if B_ind is not None:
             metrics_B_tau[tau] = bootstrap(metrics_per_protein, B_ind)
     #if B_ind is not None:
@@ -147,16 +159,35 @@ def get_metrics_B(metrics_B_tau):
     B = len(metrics_B_tau[taus[0]]) #B = number of rows in the dict at the first key (threshold)
     metrics_B = {}
     columns = ["n", "tp", "fp", "fn", "pr", "rc"]
+    if metrics_B_tau[taus[0]].shape[1] == 7:
+        columns.append("n_eval")
     for b in range(B):
         rows = []
-        metrics_b = np.zeros((len(metrics_B_tau.keys()), 6), dtype='float')
+        metrics_b = np.zeros((len(metrics_B_tau.keys()), len(columns)), dtype='float')
         for i, tau in enumerate(taus):
             metrics_b[i] = metrics_B_tau[tau][b]
         metrics_B[b] = pd.DataFrame(metrics_b, columns=columns)
     return metrics_B
 
+
+def get_bootstrap_test_indices(B_ind):
+    """
+    Select a deterministic 10% subset of bootstrap replicates for runtime checks.
+
+    The invariant checks recompute per-replicate sums from the sampled rows.
+    Running them for every bootstrap replicate is redundant and can be costly
+    when B is large, so validate a small subset derived from B_ind.
+    """
+    if len(B_ind) == 0:
+        return set()
+    n_tests = max(1, int(np.ceil(len(B_ind) * 0.10)))
+    return set(np.linspace(0, len(B_ind) - 1, n_tests, dtype='int'))
+
+
 def bootstrap(metrics_per_protein, B_ind):
-    metrics_B_tau = np.zeros((len(B_ind), 6), dtype='float')
+    has_eligibility = "eligible" in metrics_per_protein.columns
+    test_indices = get_bootstrap_test_indices(B_ind)
+    metrics_B_tau = np.zeros((len(B_ind), 7), dtype='float')
     for b, ind in enumerate(B_ind):
         metrics_per_protein_b = metrics_per_protein.iloc[ind]
         # n_gt_b = n_gt[ind]
@@ -168,8 +199,16 @@ def bootstrap(metrics_per_protein, B_ind):
         #n_pred_b = p_b.sum(axis=1)  # TP + FP
         #n_intersection_b = intersection_b.sum(axis=1)  # TP
 
-        # Number of proteins with at least one term predicted with score >= ta
-        metrics_B_tau[b, 0] = (metrics_per_protein_b["n_pred"] > 0).sum()
+        # Number of proteins with at least one term predicted with score >= tau.
+        # In partial-knowledge evaluation, coverage counts only sampled rows
+        # that still have evaluable GT after known annotations are excluded.
+        if has_eligibility:
+            eligible_b = metrics_per_protein_b["eligible"].astype(bool)
+            metrics_B_tau[b, 0] = ((metrics_per_protein_b["n_pred"] > 0) & eligible_b).sum()
+            metrics_B_tau[b, 6] = eligible_b.sum()
+        else:
+            metrics_B_tau[b, 0] = (metrics_per_protein_b["n_pred"] > 0).sum()
+            metrics_B_tau[b, 6] = len(metrics_per_protein_b)
 
         # Sum of confusion matrices
         metrics_B_tau[b, 1] = metrics_per_protein_b["TP"].sum()  # TP
@@ -181,12 +220,18 @@ def bootstrap(metrics_per_protein, B_ind):
                                   where=metrics_per_protein_b["n_pred"] > 0).sum()  # Precision
         metrics_B_tau[b, 5] = np.divide(metrics_per_protein_b["TP"], metrics_per_protein_b["n_gt"], out=np.zeros_like(metrics_per_protein_b["n_gt"], dtype='float'),
                                   where=metrics_per_protein_b["n_gt"] > 0).sum()  # Recall
+        if b in test_indices:
+            test_bootstrap_metrics(metrics_B_tau[b], metrics_per_protein_b, has_eligibility)
 
     return metrics_B_tau
 
 
-def bootstrap_exclude(p_perprotein, intersection, mis, remaining, n_gt, B_ind):
-    metrics_B_tau = np.zeros((len(B_ind), 6), dtype='float')
+def bootstrap_exclude(p_perprotein, intersection, mis, remaining, n_gt, B_ind, eligible_rows=None):
+    has_eligibility = eligible_rows is not None
+    if has_eligibility:
+        eligible_rows = np.asarray(eligible_rows)
+    test_indices = get_bootstrap_test_indices(B_ind)
+    metrics_B_tau = np.zeros((len(B_ind), 7), dtype='float')
     for b, ind in enumerate(B_ind):
         n_gt_b = n_gt[ind]
 
@@ -199,7 +244,13 @@ def bootstrap_exclude(p_perprotein, intersection, mis, remaining, n_gt, B_ind):
         n_intersection_b = np.array([inter.sum() for inter in intersection_b])  # TP
 
         # Number of proteins with at least one term predicted with score >= tau
-        metrics_B_tau[b, 0] = (n_pred_b > 0).sum()
+        if has_eligibility:
+            eligible_b = eligible_rows[ind].astype(bool)
+            metrics_B_tau[b, 0] = ((n_pred_b > 0) & eligible_b).sum()
+            metrics_B_tau[b, 6] = eligible_b.sum()
+        else:
+            metrics_B_tau[b, 0] = (n_pred_b > 0).sum()
+            metrics_B_tau[b, 6] = len(n_pred_b)
 
         # Sum of confusion matrices
         metrics_B_tau[b, 1] = n_intersection_b.sum()  # TP
@@ -211,6 +262,17 @@ def bootstrap_exclude(p_perprotein, intersection, mis, remaining, n_gt, B_ind):
                                   where=n_pred_b > 0).sum()  # Precision
         metrics_B_tau[b, 5] = np.divide(n_intersection_b, n_gt_b, out=np.zeros_like(n_gt_b, dtype='float'),
                                   where=n_gt_b > 0).sum()  # Recall
+        metrics_per_protein_b = pd.DataFrame({
+            'n_pred': n_pred_b,
+            'TP': n_intersection_b,
+            'FP': [m.sum() for m in mis_b],
+            'FN': [r.sum() for r in remaining_b],
+            'n_gt': n_gt_b,
+        })
+        if has_eligibility:
+            metrics_per_protein_b['eligible'] = eligible_b
+        if b in test_indices:
+            test_bootstrap_metrics(metrics_B_tau[b], metrics_per_protein_b, has_eligibility)
 
     return metrics_B_tau
 
@@ -301,14 +363,36 @@ def compute_metrics(pred, gt_matrix, tau_arr, toi, gt_exclude=None, ic_arr=None,
     return metrics, metrics_B
 
 
+def make_bootstrap_indices(n_rows, B=0, B_pct=0):
+    """
+    Generate bootstrap indices in the row space used by compute_metrics().
+
+    The evaluator filters GT proteins to the term set before building
+    per-protein metric rows, and weighted IA evaluation can use a smaller row
+    set than unweighted evaluation. Bootstrap indices therefore must be based
+    on the filtered metric-row count, not on the original GT matrix length.
+    """
+    B_ind = []
+    if B and B_pct > 0:
+        nB = round((B_pct / 100) * n_rows)
+        for b in range(B):
+            B_ind.append(random.choices(range(0, n_rows), k=nB))
+    return B_ind
+
 
 def normalize(metrics, ns, tau_arr, ne, normalization):
 
+    # Bootstrap metrics are computed on resampled proteins, so every metric
+    # normalized by the evaluable GT population must use the resampled
+    # denominator (`n_eval`). Otherwise cov uses the bootstrap denominator
+    # while recall/MI/RU still use the original full-run denominator.
+    gt_denominator = metrics["n_eval"].to_numpy(dtype='float') if "n_eval" in metrics.columns else ne
+
     # Normalize columns
     for column in metrics.columns:
-        if column != "n":
+        if column not in ["n", "n_eval"]:
             # By default normalize by gt
-            denominator = ne
+            denominator = gt_denominator
             # Otherwise normalize by pred
             if normalization == 'pred' or (normalization == 'cafa' and column == "pr"):
                 denominator = metrics["n"]
@@ -318,7 +402,10 @@ def normalize(metrics, ns, tau_arr, ne, normalization):
 
     metrics['ns'] = [ns] * len(tau_arr)
     metrics['tau'] = tau_arr
-    metrics['cov'] = metrics['n'] / ne
+    metrics['cov'] = np.divide(metrics['n'], gt_denominator,
+                               out=np.zeros_like(metrics['n'], dtype='float'),
+                               where=gt_denominator > 0)
+    test_norm_metric(metrics['cov'], name='coverage')
     metrics['mi'] = metrics['fp']
     metrics['ru'] = metrics['fn']
 
@@ -333,6 +420,9 @@ def normalize(metrics, ns, tau_arr, ne, normalization):
                                     out=np.zeros_like(metrics['tp'], dtype='float'),
                                     where=(metrics['tp'] + metrics['fn']) > 0)
     metrics['f_micro'] = compute_f(metrics['pr_micro'], metrics['rc_micro'])
+
+    if "n_eval" in metrics.columns:
+        metrics.drop(columns=["n_eval"], inplace=True)
 
     return metrics
 
@@ -363,14 +453,9 @@ def evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude=None, no
 
         ne = np.full(len(tau_arr), num_annot_prots)
 
-        # Generate B sets of indices
-        B_ind = []
-        N = len(gt[ns].ids)  # Number of proteins
-        nB = 0
-        if B and B_pct > 0:
-            nB = round((B_pct / 100) * N)  # Number of proteins to be included in each bootstrap round
-            for b in range(B):
-                B_ind.append(random.choices(range(0, N), k=nB))
+        # Generate B sets of indices in the filtered metric-row space.
+        unweighted_bootstrap_n_rows = len(proteins_with_gt)
+        B_ind = make_bootstrap_indices(unweighted_bootstrap_n_rows, B, B_pct)
 
         metrics, metrics_B = compute_metrics(prediction[ns].matrix, gt[ns].matrix, tau_arr, ontologies[ns].toi, exclude, None, n_cpu, B_ind = B_ind)
         dfs.append(normalize(metrics, ns, tau_arr, ne, normalization))
@@ -401,7 +486,11 @@ def evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude=None, no
                                        p_idx, p in enumerate(proteins_with_gt)])
 
             ne = np.full(len(tau_arr), num_annot_prots)
-            metrics_w, metrics_B_w = compute_metrics(prediction[ns].matrix, gt[ns].matrix, tau_arr, ontologies[ns].toi_ia, exclude, ontologies[ns].ia, n_cpu, B_ind = B_ind)
+            if len(proteins_with_gt) == unweighted_bootstrap_n_rows:
+                B_ind_w = B_ind
+            else:
+                B_ind_w = make_bootstrap_indices(len(proteins_with_gt), B, B_pct)
+            metrics_w, metrics_B_w = compute_metrics(prediction[ns].matrix, gt[ns].matrix, tau_arr, ontologies[ns].toi_ia, exclude, ontologies[ns].ia, n_cpu, B_ind = B_ind_w)
             dfs_w.append(normalize(metrics_w, ns, tau_arr, ne, normalization))
             metrics_B_w_df = []
             if metrics_B_w:
@@ -519,4 +608,3 @@ def write_results(df, dfs_best, metrics_B_df, out_dir='results', th_step=0.01):
 
     if isinstance(metrics_B_df, pd.DataFrame):
         metrics_B_df.to_csv('{}/Bootstrap_all.tsv'.format(out_folder), float_format="%.{}f".format(decimals), sep="\t")
-
