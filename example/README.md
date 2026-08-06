@@ -136,3 +136,7 @@ The fixed evaluator should keep regular coverage and weighted coverage bounded b
 filename    n    cov    n_w    cov_w
 pred_3.tsv  2.0  1.0    1.0    1.0
 ```
+
+Sparse evaluation is enabled by default. The same bounded coverage result is
+expected with the sparse path and with the dense fallback
+(`CAFAEVAL_SPARSE=0`).

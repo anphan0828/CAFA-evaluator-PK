@@ -1,16 +1,21 @@
-from cafaeval.graph import Graph, Prediction, GroundTruth, propagate
-import numpy as np
 import logging
+import os
+
+import numpy as np
+from scipy.sparse import csr_matrix
+
+from cafaeval.graph import Graph, GroundTruth, Prediction, propagate, propagate_to_coo
+from cafaeval.sparse import use_fast_parser
+
+
 logging.getLogger(__name__).addHandler(logging.NullHandler())
-# import xml.etree.ElementTree as ET
 
 
 def obo_parser(obo_file, valid_rel=("is_a", "part_of"), ia_file=None, orphans=True):
     """
-    Parse a OBO file and returns a list of ontologies, one for each namespace.
-    Obsolete terms are excluded as well as external namespaces.
+    Parse an OBO file and return ontologies, one for each namespace.
+    Obsolete terms are excluded, as are external namespaces.
     """
-    # Parse the OBO file and creates a different graph for each namespace
     term_dict = {}
     term_id = None
     namespace = None
@@ -26,22 +31,19 @@ def obo_parser(obo_file, valid_rel=("is_a", "part_of"), ia_file=None, orphans=Tr
                 k = line[0]
                 v = ": ".join(line[1:])
                 if k == "id":
-                    # Populate the dictionary with the previous entry
                     if term_id is not None and obsolete is False and namespace is not None:
-                        term_dict.setdefault(namespace, {})[term_id] = {'name': name,
-                                                                       'namespace': namespace,
-                                                                       'def': term_def,
-                                                                       'alt_id': alt_id,
-                                                                       'rel': rel}
-                    # Assign current term ID
+                        term_dict.setdefault(namespace, {})[term_id] = {
+                            'name': name,
+                            'namespace': namespace,
+                            'def': term_def,
+                            'alt_id': alt_id,
+                            'rel': rel,
+                        }
                     term_id = v
-
-                    # Reset optional fields
                     alt_id = []
                     rel = []
                     obsolete = False
                     namespace = None
-
                 elif k == "alt_id":
                     alt_id.append(v)
                 elif k == "name":
@@ -53,40 +55,27 @@ def obo_parser(obo_file, valid_rel=("is_a", "part_of"), ia_file=None, orphans=Tr
                 elif k == 'is_obsolete':
                     obsolete = True
                 elif k == "is_a" and k in valid_rel:
-                    s = v.split('!')[0].strip()
-                    rel.append(s)
+                    rel.append(v.split('!')[0].strip())
                 elif k == "relationship" and v.startswith("part_of") and "part_of" in valid_rel:
-                    s = v.split()[1].strip()
-                    rel.append(s)
+                    rel.append(v.split()[1].strip())
 
-        # Last record
         if obsolete is False and namespace is not None:
-            term_dict.setdefault(namespace, {})[term_id] = {'name': name,
-                                                          'namespace': namespace,
-                                                          'def': term_def,
-                                                          'alt_id': alt_id,
-                                                          'rel': rel}
+            term_dict.setdefault(namespace, {})[term_id] = {
+                'name': name,
+                'namespace': namespace,
+                'def': term_def,
+                'alt_id': alt_id,
+                'rel': rel,
+            }
 
-    # Parse IA file
-    ia_dict = None
-    if ia_file is not None:
-        ia_dict = ia_parser(ia_file)
-
-    ontologies = {}
-    for ns, ont_dict in term_dict.items():
-        ontologies[ns] = Graph(ns, ont_dict, ia_dict, orphans)
-
-    return ontologies
+    ia_dict = ia_parser(ia_file) if ia_file is not None else None
+    return {ns: Graph(ns, ont_dict, ia_dict, orphans) for ns, ont_dict in term_dict.items()}
 
 
 def update_toi(ontologies, toi_file):
     """
-    Remove terms not of interest from evaluation, eg for terms obsoleted since ontology was created
-    :param ontologies: dict returned from obo_parser
-    :param term_file: file with GO IDs to include in the terms of interest
-    :return: copy of ontologies with updated toi
+    Remove terms not of interest from evaluation.
     """
-    # load file of terms
     new_toi = {ns: [] for ns in ontologies.keys()}
     with open(toi_file) as f:
         for line in f:
@@ -96,18 +85,12 @@ def update_toi(ontologies, toi_file):
                 for ns in ontologies.keys():
                     if term in ontologies[ns].terms_dict.keys():
                         new_toi[ns].append(ontologies[ns].terms_dict[term]['index'])
-
-                    # catch alt IDs if used
                     elif term in ontologies[ns].terms_dict_alt.keys():
-                        alt_ids = ontologies[ns].terms_dict_alt[term]
-                        for alt_id in alt_ids:
+                        for alt_id in ontologies[ns].terms_dict_alt[term]:
                             new_toi[ns].append(ontologies[ns].terms_dict[alt_id]['index'])
 
-    # take intersection to make sure roots are excluded if needed
     for ns in ontologies.keys():
         ontologies[ns].toi = np.array(list(set(new_toi[ns]).intersection(ontologies[ns].toi)))
-
-    # toi_ia is the non-zero IA terms. We need to remove any terms not in the TOI file from there too
     for ns in ontologies.keys():
         if ontologies[ns].toi_ia is not None:
             ontologies[ns].toi_ia = np.array(list(set(new_toi[ns]).intersection(ontologies[ns].toi_ia)))
@@ -130,7 +113,6 @@ def gt_parser(gt_file, ontologies):
                     if term_id in ontologies[ns].terms_dict:
                         gt_dict.setdefault(ns, {}).setdefault(p_id, []).append(term_id)
                         break
-                    # Replace alternative ids with canonical ids
                     elif term_id in ontologies[ns].terms_dict_alt:
                         for t_id in ontologies[ns].terms_dict_alt[term_id]:
                             gt_dict.setdefault(ns, {}).setdefault(p_id, []).append(t_id)
@@ -141,19 +123,31 @@ def gt_parser(gt_file, ontologies):
     gts = {}
     for ns in ontologies:
         if gt_dict.get(ns):
-            matrix = np.zeros((len(gt_dict[ns]), ontologies[ns].idxs), dtype='bool')
+            ont = ontologies[ns]
+            matrix = np.zeros((len(gt_dict[ns]), ont.idxs), dtype='bool')
             ids = {}
+            nnz_est = sum(len(v) for v in gt_dict[ns].values())
+            nz_rows = np.empty(nnz_est, dtype=np.int64)
+            nz_cols = np.empty(nnz_est, dtype=np.int64)
+            k = 0
+            terms_dict = ont.terms_dict
             for i, p_id in enumerate(gt_dict[ns]):
                 ids[p_id] = i
                 for term_id in gt_dict[ns][p_id]:
-                    matrix[i, ontologies[ns].terms_dict[term_id]['index']] = 1
-            logging.debug("gt matrix {} {} ".format(ns, matrix))
-            
-            propagate(matrix, ontologies[ns], ontologies[ns].order, mode='max')
-            logging.debug("gt matrix propagated {} {} ".format(ns, matrix))
+                    col = terms_dict[term_id]['index']
+                    matrix[i, col] = 1
+                    nz_rows[k] = i
+                    nz_cols[k] = col
+                    k += 1
+            nz_rows = nz_rows[:k]
+            nz_cols = nz_cols[:k]
+            nz_scores = np.ones(k, dtype=matrix.dtype)
+
+            propagate(matrix, ont, ont.order, mode='max', _triples=(nz_rows, nz_cols, nz_scores))
             gts[ns] = GroundTruth(ids, matrix, ns)
-            logging.info('Ground truth: {}, proteins {}, annotations {}, replaced alt. ids {}'.format(ns, len(ids),
-                                                                                np.count_nonzero(matrix), replaced.get(ns, 0)))
+            logging.info('Ground truth: {}, proteins {}, annotations {}, replaced alt. ids {}'.format(
+                ns, len(ids), np.count_nonzero(matrix), replaced.get(ns, 0)
+            ))
 
     return gts
 
@@ -162,79 +156,293 @@ def gt_exclude_parser(exclude_file, gt, ontologies):
     """
     Process terms that should be excluded from evaluation.
     """
-    # Propagate exclude terms and parse alternative IDs
     exclude_gt = gt_parser(exclude_file, ontologies)
-
-    # reindex exclusion matrices to match ground truth
     exclude = {}
     for ns in gt:
         exclude_matrix = np.zeros_like(gt[ns].matrix)
+        if ns not in exclude_gt:
+            exclude[ns] = GroundTruth(gt[ns].ids, exclude_matrix, ns)
+            continue
         for protein, gt_index in gt[ns].ids.items():
-            # Keep row corresponding to gt proteins
             if protein in exclude_gt[ns].ids:
                 exclude_matrix[gt_index, :] = exclude_gt[ns].matrix[exclude_gt[ns].ids[protein], :]
         exclude[ns] = GroundTruth(gt[ns].ids, exclude_matrix, ns)
     return exclude
 
-def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
-    """
-    Parse a prediction file and returns a list of prediction objects, one for each namespace.
-    If a predicted is predicted multiple times for the same target, it stores the max.
-    This is the slow step if the input file is huge, ca. 1 minute for 5GB input on SSD disk.
-    """
-    ids = {}
-    matrix = {}
-    ns_dict = {}  # {namespace: term}
-    replaced = {}
-    for ns in gts:
-        matrix[ns] = np.zeros(gts[ns].matrix.shape, dtype='float')
-        ids[ns] = {}
-        for term in ontologies[ns].terms_dict:
-            ns_dict[term] = ns
-        for term in ontologies[ns].terms_dict_alt:
-            ns_dict[term] = ns
 
-    with open(pred_file) as f:
+def _split_prediction_line(line):
+    if ',' in line:
+        return line.strip().split(',')
+    if '\t' in line:
+        return line.strip().split('\t')
+    return line.strip().split()
+
+
+def _pred_parser_legacy(pred_file, ontologies, gts, ns_dict, term_index, ids,
+                        matrix, row_nnz, replaced, max_terms):
+    with open(pred_file, buffering=1024 * 1024) as f:
         for line in f:
-            if ',' in line:
-                # Handle CSV files
-                line = line.strip().split(',')
-            elif '\t' in line:
-                # Handle TSV files
-                line = line.strip().split('\t')
-            else:
-                line = line.strip().split()
+            line = _split_prediction_line(line)
             if line and len(line) > 2:
                 p_id, term_id, prob = line[:3]
                 ns = ns_dict.get(term_id)
                 if ns in gts and p_id in gts[ns].ids:
-                    # Get protein index
                     i = gts[ns].ids[p_id]
-                    # Replace alternative ids with canonical ids
                     term_ids = [term_id]
                     if term_id in ontologies[ns].terms_dict_alt:
                         term_ids = ontologies[ns].terms_dict_alt[term_id]
                         replaced.setdefault(ns, 0)
                         replaced[ns] += len(term_ids)
                     for term_id in term_ids:
-                        if max_terms is None or np.count_nonzero(matrix[ns][i]) <= max_terms:
-                            j = ontologies[ns].terms_dict.get(term_id)['index']
+                        j = term_index[ns].get(term_id)
+                        old = matrix[ns][i, j]
+                        if max_terms is not None and old == 0.0 and row_nnz[ns][i] > max_terms:
+                            continue
+                        prob_f = float(prob)
+                        if prob_f > old:
                             ids[ns][p_id] = i
-                            matrix[ns][i, j] = max(matrix[ns][i, j], float(prob))
+                            matrix[ns][i, j] = prob_f
+                            if old == 0.0:
+                                row_nnz[ns][i] += 1
+
+
+def _detect_pred_delimiter(pred_file, max_lines=64, max_bytes=1024 * 1024):
+    candidate_order = ("\t", ",", ";", "|", " ")
+    candidate_bytes = {c: c.encode("ascii") for c in candidate_order}
+    lines = []
+    bytes_read = 0
+
+    with open(pred_file, "rb") as handle:
+        while len(lines) < max_lines and bytes_read < max_bytes:
+            line = handle.readline()
+            if not line:
+                break
+            bytes_read += len(line)
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+
+    if not lines:
+        raise ValueError("empty prediction file")
+
+    matches = []
+    for rank, delimiter in enumerate(candidate_order):
+        delimiter_byte = candidate_bytes[delimiter]
+        valid_rows = sum(line.count(delimiter_byte) == 2 for line in lines)
+        if valid_rows == len(lines):
+            matches.append((rank, delimiter))
+    if not matches:
+        raise ValueError("could not detect a single-character prediction delimiter")
+    return min(matches)[1]
+
+
+def _pred_parser_vectorised(pred_file, ontologies, gts, ns_dict, term_index,
+                            ids, pred_coo, replaced):
+    import pyarrow as pa
+    import pyarrow.csv as pc
+
+    delimiter = _detect_pred_delimiter(pred_file)
+    tbl = pc.read_csv(
+        pred_file,
+        read_options=pc.ReadOptions(column_names=["pid", "tid", "prob"]),
+        parse_options=pc.ParseOptions(delimiter=delimiter),
+        convert_options=pc.ConvertOptions(column_types={
+            "pid": pa.string(),
+            "tid": pa.large_string(),
+            "prob": pa.float64(),
+        }),
+    )
+    if tbl.num_rows == 0:
+        return
+
+    pids_dict = tbl.column("pid").combine_chunks().dictionary_encode()
+    tids_dict = tbl.column("tid").combine_chunks().dictionary_encode()
+    probs_arr = tbl.column("prob").combine_chunks().to_numpy(zero_copy_only=True)
+
+    pid_unique = pids_dict.dictionary.to_pylist()
+    tid_unique = tids_dict.dictionary.to_pylist()
+    pid_codes = pids_dict.indices.to_numpy(zero_copy_only=False)
+    tid_codes = tids_dict.indices.to_numpy(zero_copy_only=False)
+
+    ns_list = list(gts.keys())
+    ns_to_idx = {ns: i for i, ns in enumerate(ns_list)}
+
+    tid_ns_code = np.full(len(tid_unique), -1, dtype=np.int8)
+    for code, tid in enumerate(tid_unique):
+        ns = ns_dict.get(tid)
+        if ns is not None and ns in ns_to_idx:
+            tid_ns_code[code] = ns_to_idx[ns]
+
+    tid_col_per_ns = []
+    for ns in ns_list:
+        tmap = term_index[ns]
+        alt_dict = ontologies[ns].terms_dict_alt
+        col_arr = np.full(len(tid_unique), -1, dtype=np.int64)
+        for code, tid in enumerate(tid_unique):
+            canon_col = tmap.get(tid)
+            if canon_col is not None:
+                col_arr[code] = canon_col
+            elif alt_dict and tid in alt_dict:
+                col_arr[code] = -2
+        tid_col_per_ns.append(col_arr)
+
+    pid_row_per_ns = []
+    for ns in ns_list:
+        gt_ids = gts[ns].ids
+        row_arr = np.full(len(pid_unique), -1, dtype=np.int64)
+        for code, pid in enumerate(pid_unique):
+            v = gt_ids.get(pid)
+            if v is not None:
+                row_arr[code] = v
+        pid_row_per_ns.append(row_arr)
+
+    row_ns = tid_ns_code[tid_codes]
+
+    for ns_idx, ns in enumerate(ns_list):
+        ns_mask = row_ns == ns_idx
+        if not ns_mask.any():
+            continue
+
+        pid_codes_ns = pid_codes[ns_mask]
+        tid_codes_ns = tid_codes[ns_mask]
+        probs_ns = probs_arr[ns_mask]
+
+        p_idx_all = pid_row_per_ns[ns_idx][pid_codes_ns]
+        in_gt = p_idx_all >= 0
+        if not in_gt.any():
+            continue
+        p_idx_all = p_idx_all[in_gt]
+        tid_codes_ns = tid_codes_ns[in_gt]
+        probs_ns = probs_ns[in_gt]
+
+        col_lookup = tid_col_per_ns[ns_idx]
+        col_all = col_lookup[tid_codes_ns]
+        canonical_mask = col_all >= 0
+        alt_mask = col_all == -2
+
+        p_idx_parts = [p_idx_all[canonical_mask]]
+        t_idx_parts = [col_all[canonical_mask]]
+        v_parts = [probs_ns[canonical_mask]]
+
+        if alt_mask.any():
+            alt_dict = ontologies[ns].terms_dict_alt
+            ns_term_index = term_index[ns]
+            alt_pos = np.flatnonzero(alt_mask)
+            exp_p = []
+            exp_t = []
+            exp_v = []
+            for k in alt_pos:
+                tid_str = tid_unique[tid_codes_ns[k]]
+                canon_set = alt_dict.get(tid_str)
+                if not canon_set:
+                    continue
+                replaced[ns] = replaced.get(ns, 0) + len(canon_set)
+                for canon in canon_set:
+                    col = ns_term_index.get(canon)
+                    if col is None:
+                        continue
+                    exp_p.append(int(p_idx_all[k]))
+                    exp_t.append(col)
+                    exp_v.append(float(probs_ns[k]))
+            if exp_p:
+                p_idx_parts.append(np.asarray(exp_p, dtype=np.int64))
+                t_idx_parts.append(np.asarray(exp_t, dtype=np.int64))
+                v_parts.append(np.asarray(exp_v, dtype=np.float64))
+
+        p_final = np.concatenate(p_idx_parts) if len(p_idx_parts) > 1 else p_idx_parts[0]
+        t_final = np.concatenate(t_idx_parts) if len(t_idx_parts) > 1 else t_idx_parts[0]
+        v_final = np.concatenate(v_parts) if len(v_parts) > 1 else v_parts[0]
+        if p_final.size == 0:
+            continue
+
+        n_terms = gts[ns].matrix.shape[1]
+        flat = p_final * np.int64(n_terms) + t_final
+        order = np.argsort(flat, kind="stable")
+        flat_s = flat[order]
+        v_s = v_final[order]
+        starts = np.empty(flat_s.size, dtype=bool)
+        starts[0] = True
+        np.not_equal(flat_s[1:], flat_s[:-1], out=starts[1:])
+        start_idx = np.flatnonzero(starts)
+        max_v = np.maximum.reduceat(v_s, start_idx)
+        unique_flat = flat_s[start_idx]
+        unique_rows = unique_flat // np.int64(n_terms)
+        unique_cols = unique_flat % np.int64(n_terms)
+        pred_coo[ns] = (unique_rows, unique_cols, max_v)
+
+        prot_has_any = np.zeros(gts[ns].matrix.shape[0], dtype=bool)
+        prot_has_any[unique_rows[max_v > 0.0]] = True
+        surviving_rows = np.flatnonzero(prot_has_any)
+        if surviving_rows.size:
+            inv_ids = {int(v): k for k, v in gts[ns].ids.items()}
+            for r in surviving_rows.tolist():
+                ids[ns][inv_ids[r]] = r
+
+
+def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None, n_cpu=0):
+    """
+    Parse a prediction file and return Prediction objects, one per namespace.
+    """
+    ids = {}
+    pred_coo = {}
+    matrix = {}
+    ns_dict = {}
+    replaced = {}
+    row_nnz = {}
+    term_index = {}
+    for ns in gts:
+        ids[ns] = {}
+        term_index[ns] = {t: info["index"] for t, info in ontologies[ns].terms_dict.items()}
+        for term in ontologies[ns].terms_dict:
+            ns_dict[term] = ns
+        for term in ontologies[ns].terms_dict_alt:
+            ns_dict[term] = ns
+
+    used_fast_path = False
+    if max_terms is None and use_fast_parser():
+        try:
+            _pred_parser_vectorised(pred_file, ontologies, gts, ns_dict, term_index, ids, pred_coo, replaced)
+            used_fast_path = True
+        except Exception as exc:
+            logging.warning(
+                "pred_parser fast path failed for {}: {}; falling back to legacy loop".format(pred_file, repr(exc))
+            )
+            pred_coo.clear()
+            for ns in gts:
+                ids[ns].clear()
+            replaced.clear()
+
+    if not used_fast_path:
+        for ns in gts:
+            matrix[ns] = np.zeros(gts[ns].matrix.shape, dtype='float')
+            row_nnz[ns] = np.zeros(gts[ns].matrix.shape[0], dtype=np.int32)
+        _pred_parser_legacy(pred_file, ontologies, gts, ns_dict, term_index, ids,
+                            matrix, row_nnz, replaced, max_terms)
+        for ns in gts:
+            r, c = np.nonzero(matrix[ns])
+            pred_coo[ns] = (r, c, matrix[ns][r, c])
+            matrix[ns] = None
 
     predictions = {}
     for ns in ids:
-        if ids[ns]:
-            logging.debug("pred matrix {} {} ".format(ns, matrix))
-            propagate(matrix[ns], ontologies[ns], ontologies[ns].order, mode=prop_mode)
-            logging.debug("pred matrix {} {} ".format(ns, matrix))
-
-            predictions[ns] = Prediction(ids[ns], matrix[ns], ns)
-            logging.info("Prediction: {}, {}, proteins {}, annotations {}, replaced alt. ids {}".format(pred_file, ns, len(ids[ns]),
-                                                                                np.count_nonzero(matrix[ns]), replaced.get(ns, 0)))
+        if ids[ns] and ns in pred_coo:
+            rows, cols, vals = pred_coo[ns]
+            shape = gts[ns].matrix.shape
+            if prop_mode == "max":
+                prows, pcols, pvals = propagate_to_coo((rows, cols, vals), ontologies[ns], "max")
+            else:
+                dense = np.zeros(shape, dtype='float')
+                dense[rows, cols] = vals
+                propagate(dense, ontologies[ns], ontologies[ns].order, mode=prop_mode, parallel=n_cpu)
+                prows, pcols = np.nonzero(dense)
+                pvals = dense[prows, pcols]
+            pred_csr = csr_matrix((pvals, (prows, pcols)), shape=shape)
+            predictions[ns] = Prediction(ids[ns], pred_csr, ns)
+            logging.info("Prediction: {}, {}, proteins {}, annotations {}, replaced alt. ids {}".format(
+                pred_file, ns, len(ids[ns]), int(pred_csr.nnz), replaced.get(ns, 0)
+            ))
 
     if not predictions:
-        # raise Exception("Empty prediction, check format")
         logging.warning("Empty prediction! Check format or overlap with ground truth")
 
     return predictions

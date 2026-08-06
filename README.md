@@ -62,6 +62,53 @@ sub-folders are processed recursively and the sub-folder name is used as prefix 
 
 Example input files are provided inside the `data/example` folder. 
 
+### Sparse evaluation and parser acceleration
+
+This fork includes sparse evaluator optimizations ported from
+`cafaeval-protea`. `scipy` is now required because prediction matrices are
+stored as CSR sparse matrices after parsing and propagation. Sparse evaluation
+is enabled by default and can be disabled for debugging or parity checks:
+
+```bashcon
+CAFAEVAL_SPARSE=0 python3 /path/to/CAFA-evaluator/src/cafaeval/__main__.py ontology_file prediction_folder ground_truth_file
+```
+
+The optional PyArrow parser can speed up large prediction files and supports
+tab, comma, semicolon, pipe, and single-space delimiters. Install the optional
+extra if you want that fast path:
+
+```bashcon
+pip install '.[fast]'
+```
+
+The fast parser is enabled by default when PyArrow is available. It falls back
+to the legacy line parser automatically if PyArrow is missing, if parsing
+fails, or when `-max_terms` is used. Set `CAFAEVAL_FAST_PARSER=0` to force the
+legacy parser.
+
+In Partial-Knowledge evaluation, coverage and weighted coverage are counted
+over the same post-exclusion eligible protein population as their denominators.
+This keeps `cov` and `cov_w` bounded by 1, including cases where all remaining
+ground-truth terms for a protein have IA 0.
+
+### Bootstrap behavior
+
+Bootstrap output is enabled with `-B` and `-B_pct` and is written to
+`Bootstrap_all.tsv`. Bootstrap samples are paired across prediction files by
+default: replicate `b` uses the same resampled target rows for every method
+within each namespace and metric mode. This is the recommended setting for
+method comparisons because per-replicate differences are computed on the same
+sampled proteins.
+
+Set `PAIRED_BOOTSTRAP=0` to recover the original non-paired behavior, where
+each prediction file generates its own bootstrap samples:
+
+```bashcon
+PAIRED_BOOTSTRAP=0 python3 /path/to/CAFA-evaluator/src/cafaeval/__main__.py ontology_file prediction_folder ground_truth_file -B 1000 -B_pct 50
+```
+
+Both paired and non-paired modes use the same sparse evaluator and parser paths.
+
 ### Command line
 
 When executed from the command line the script logs information about the calculation in the console (standard error) and
@@ -91,7 +138,9 @@ python3 /path/to/CAFA-evaluator/src/cafaeval/__main__.py ontology_file predictio
 
 
 ## Input files
-**Prediction file** - Tab separated file with the target ID, term ID and score columns.
+**Prediction file** - File with the target ID, term ID and score columns.
+The legacy parser supports tab, comma, and whitespace separators. The optional
+PyArrow fast parser also supports semicolon and pipe separators.
 
 ~~~txt
 A0A0A6YY25  GO:0010468  3.6396e-05
@@ -180,4 +229,3 @@ A different file for each metric is created.
 |  -th_step   |      0.01  | Step size of prediction score thresholds to consider in the range [0, 1). A smaller step, means more calculation                                                                                                                                                          |
 | -max_terms  |            | Number of terms for protein and namespace to consider in the evaluation. Parsing stops when the target limit for every namespace is reached. The score is not checked, meaning that terms are not sorted before the check, and the check is performed before propagation. |
 |  -threads   |       4    | Parallel threads. `0` means use all available CPU threads. Do not use multi thread if you are short in memory                                                                                                                                                             |
-

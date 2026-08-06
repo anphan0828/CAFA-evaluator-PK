@@ -3,11 +3,18 @@ import random
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
+from scipy.sparse import issparse
 from cafaeval.parser import obo_parser, gt_parser, pred_parser, gt_exclude_parser, update_toi
+from cafaeval.sparse import (
+    compute_confusion_matrix_exclude_sparse,
+    compute_confusion_matrix_sparse,
+    count_proteins_in_toi,
+    toi_is_full,
+    use_sparse,
+)
 from cafaeval.tests import test_norm_metric, test_intersection, test_bootstrap_metrics
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
-
 
 # Return a mask for all the predictions (matrix) >= tau
 def solidify_prediction(pred, tau):
@@ -24,6 +31,30 @@ def compute_f(pr, rc):
 def compute_s(ru, mi):
     return np.sqrt(ru**2 + mi**2)
     # return np.where(np.isnan(ru), mi, np.sqrt(ru + np.nan_to_num(mi)))
+
+
+def warn_empty_post_exclusion_gt(n_gt, ic_arr=None):
+    n_empty = int(np.count_nonzero(np.asarray(n_gt) == 0))
+    if n_empty == 0:
+        return
+    metric_mode = "IA-weighted" if ic_arr is not None else "unweighted"
+    positive_ia_note = " positive-IA" if ic_arr is not None else ""
+    logging.warning(
+        "%s partial-knowledge evaluation: %d proteins had ground-truth "
+        "annotations in the terms of interest before known-annotation "
+        "exclusion, but no evaluable%s ground-truth annotations remained.",
+        metric_mode,
+        n_empty,
+        positive_ia_note,
+    )
+
+
+def use_paired_bootstrap():
+    return os.environ.get("PAIRED_BOOTSTRAP", "1") not in ("0", "false", "False")
+
+
+def _proteins_with_gt(gt_matrix, toi):
+    return np.where((gt_matrix[:, toi] != 0).any(axis=1))[0]
 
 
 def compute_confusion_matrix(tau_arr, g, pred_matrix, toi, n_gt, ic_arr=None, B_ind = None):
@@ -186,7 +217,7 @@ def get_bootstrap_test_indices(B_ind):
 
 def bootstrap(metrics_per_protein, B_ind):
     has_eligibility = "eligible" in metrics_per_protein.columns
-    test_indices = get_bootstrap_test_indices(B_ind)
+    # test_indices = get_bootstrap_test_indices(B_ind)
     metrics_B_tau = np.zeros((len(B_ind), 7), dtype='float')
     for b, ind in enumerate(B_ind):
         metrics_per_protein_b = metrics_per_protein.iloc[ind]
@@ -220,8 +251,8 @@ def bootstrap(metrics_per_protein, B_ind):
                                   where=metrics_per_protein_b["n_pred"] > 0).sum()  # Precision
         metrics_B_tau[b, 5] = np.divide(metrics_per_protein_b["TP"], metrics_per_protein_b["n_gt"], out=np.zeros_like(metrics_per_protein_b["n_gt"], dtype='float'),
                                   where=metrics_per_protein_b["n_gt"] > 0).sum()  # Recall
-        if b in test_indices:
-            test_bootstrap_metrics(metrics_B_tau[b], metrics_per_protein_b, has_eligibility)
+        # if b in test_indices:
+        #     test_bootstrap_metrics(metrics_B_tau[b], metrics_per_protein_b, has_eligibility)
 
     return metrics_B_tau
 
@@ -230,7 +261,7 @@ def bootstrap_exclude(p_perprotein, intersection, mis, remaining, n_gt, B_ind, e
     has_eligibility = eligible_rows is not None
     if has_eligibility:
         eligible_rows = np.asarray(eligible_rows)
-    test_indices = get_bootstrap_test_indices(B_ind)
+    # test_indices = get_bootstrap_test_indices(B_ind)
     metrics_B_tau = np.zeros((len(B_ind), 7), dtype='float')
     for b, ind in enumerate(B_ind):
         n_gt_b = n_gt[ind]
@@ -271,8 +302,8 @@ def bootstrap_exclude(p_perprotein, intersection, mis, remaining, n_gt, B_ind, e
         })
         if has_eligibility:
             metrics_per_protein_b['eligible'] = eligible_b
-        if b in test_indices:
-            test_bootstrap_metrics(metrics_B_tau[b], metrics_per_protein_b, has_eligibility)
+        # if b in test_indices:
+        #     test_bootstrap_metrics(metrics_B_tau[b], metrics_per_protein_b, has_eligibility)
 
     return metrics_B_tau
 
@@ -283,87 +314,143 @@ def compute_metrics(pred, gt_matrix, tau_arr, toi, gt_exclude=None, ic_arr=None,
     precision, recall, remaining uncertainty and misinformation.
     Toi is the list of terms (indexes) to be considered
     """
-    # Parallelization
     if n_cpu == 0:
         n_cpu = mp.cpu_count()
+    n_cpu = max(1, min(int(n_cpu), max(1, len(tau_arr))))
 
     columns = ["n", "tp", "fp", "fn", "pr", "rc"]
-    # filter out proteins with no annotations in Terms-Of-Interest (toi)
-    proteins_has_gt = gt_matrix[:, toi].sum(1) > 0
-    proteins_with_gt = np.where(proteins_has_gt)[0]
-    gt_with_annots = gt_matrix[proteins_with_gt, :]
-    g = gt_with_annots[:, toi]
-    p = pred[proteins_has_gt, :][:, toi]
+    n_terms = gt_matrix.shape[1]
+    full_toi = toi_is_full(toi, n_terms)
+    sparse_enabled = use_sparse()
 
-    if gt_exclude is not None:
-        # g_exclude = gt_exclude.matrix[proteins_with_gt, :][:, toi]
-        toi_perprotein = [np.setdiff1d(toi, gt_exclude.matrix[p, :].nonzero()[0],
-                                       assume_unique=True) for p in
-                          proteins_with_gt] # only include proteins with annotations
-        gt_perprotein = [gt_with_annots[p_idx, tois] for p_idx, tois in enumerate(toi_perprotein)]
-        # The number of GT annotations per proteins will change to exclude the set from g_exclude
-        # count_g = np.logical_and(np.logical_not(g_exclude), g)  # count terms in g only if they are not in exclude list
-        n_gt = np.array([gpp.sum().item() for gpp in gt_perprotein])  # number of terms annotated in each protein
-        if ic_arr is not None:
-            n_gt = np.array([(gpp * ic_arr[tois]).sum().item() for gpp, tois in zip(gt_perprotein, toi_perprotein)])
-        if np.any(n_gt == 0):
-            metric_mode = 'IA-weighted' if ic_arr is not None else 'unweighted'
-            positive_ia_note = ' positive-IA' if ic_arr is not None else ''
-            logging.warning(
-                f'{metric_mode} evaluation: '
-                f'{np.count_nonzero(n_gt == 0)} proteins had ground-truth annotations before exclusion, '
-                f'(known-annotation exclusion and the terms-of-interest) but no evaluable{positive_ia_note} '
-                f'ground-truth annotations remained.'
-            )
+    if full_toi:
+        proteins_has_gt = (gt_matrix != 0).any(axis=1)
     else:
-        count_g = g
+        proteins_has_gt = (gt_matrix[:, toi] != 0).any(axis=1)
+    proteins_with_gt = np.where(proteins_has_gt)[0]
 
-        # Simple metrics
-        if ic_arr is None:
-            n_gt = count_g.sum(axis=1)
-        # Weighted metrics
-        else:
-            n_gt = (count_g * ic_arr[toi]).sum(axis=1)
+    metrics_B = []
+    metrics_B_tau = {}
 
     if gt_exclude is None:
-        arg_lists = [[tau_arr, g, p, toi, n_gt, ic_arr, B_ind] for tau_arr in np.array_split(tau_arr, n_cpu)]
+        if proteins_has_gt.all():
+            gt_with_annots = gt_matrix
+            pred_filtered = pred
+        else:
+            gt_with_annots = gt_matrix[proteins_with_gt, :]
+            pred_filtered = pred[proteins_has_gt, :]
 
-        with mp.Pool(processes=n_cpu) as pool:
-            #metrics = np.concatenate(pool.starmap(compute_confusion_matrix, arg_lists), axis=0)
-            results = pool.starmap(compute_confusion_matrix, arg_lists)
-            metrics = [results[i][0] for i in range(len(results))]
-            metrics = pd.DataFrame(np.concatenate(metrics), columns=columns)
-            metrics_B_tau = {}
-            if results[0][1]:  # If metrics from the bootstrapping were calculated
-                for thread in range(len(results)):
-                    for tau, metrics_b in results[thread][1].items():
-                        metrics_B_tau[tau] = metrics_b
+        if full_toi:
+            g = gt_with_annots
+            p = pred_filtered
+        else:
+            g = gt_with_annots[:, toi]
+            p = pred_filtered[:, toi]
+
+        if ic_arr is None:
+            n_gt = g.sum(axis=1)
+        else:
+            n_gt = (g * ic_arr[toi]).sum(axis=1)
+
+        if sparse_enabled:
+            metrics_arr, metrics_B_tau = compute_confusion_matrix_sparse(
+                tau_arr, g, p, toi, n_gt, ic_arr, B_ind=B_ind
+            )
+            metrics = pd.DataFrame(metrics_arr, columns=columns)
+            if metrics_B_tau:
+                metrics_B = get_metrics_B(metrics_B_tau)
+        else:
+            if issparse(p):
+                p = p.toarray()
+            arg_lists = [
+                [tau_chunk, g, p, toi, n_gt, ic_arr, B_ind]
+                for tau_chunk in np.array_split(tau_arr, n_cpu)
+            ]
+            with mp.Pool(processes=n_cpu) as pool:
+                results = pool.starmap(compute_confusion_matrix, arg_lists)
+            metrics = pd.DataFrame(np.concatenate([r[0] for r in results]), columns=columns)
+            for _thread, result in enumerate(results):
+                for tau, metrics_b in result[1].items():
+                    metrics_B_tau[tau] = metrics_b
+            if metrics_B_tau:
                 metrics_B = get_metrics_B(metrics_B_tau)
     else:
-        # These rows define the post-exclusion evaluation population. The PK
-        # coverage denominator in evaluate_prediction is based on this same
-        # predicate, so the coverage numerator must use it too; otherwise
-        # proteins with all GT removed by gt_exclude can make cov/cov_w > 1
-        # when they still have above-threshold predictions.
-        eligible_rows = np.array([gpp.sum().item() > 0 for gpp in gt_perprotein])
-        arg_lists = [[tau_arr, gt_perprotein, pred[gt_matrix[:,toi].sum(1)>0, :], toi_perprotein, n_gt, eligible_rows, ic_arr, B_ind] for tau_arr in np.array_split(tau_arr, n_cpu)]
-        with mp.Pool(processes=n_cpu) as pool:
-            #metrics = np.concatenate(pool.starmap(compute_confusion_matrix_exclude, arg_lists), axis=0)
-            results = pool.starmap(compute_confusion_matrix_exclude, arg_lists)
-            metrics = [results[i][0] for i in range(len(results))]
-            metrics = pd.DataFrame(np.concatenate(metrics), columns=columns)
-            metrics_B_tau = {}
-            if results[0][1]:  # If metrics from the bootstrapping were calculated
-                for thread in range(len(results)):
-                    for tau, metrics_b in results[thread][1].items():
-                        metrics_B_tau[tau] = metrics_b
+        if proteins_has_gt.all():
+            gt_with_annots = gt_matrix
+            pred_sub = pred
+        else:
+            gt_with_annots = gt_matrix[proteins_with_gt, :]
+            pred_sub = pred[proteins_has_gt, :]
+
+        if sparse_enabled:
+            if full_toi:
+                toi_mask = np.ones(n_terms, dtype=bool)
+            else:
+                toi_mask = np.zeros(n_terms, dtype=bool)
+                toi_mask[toi] = True
+            excluded_mask = gt_exclude.matrix[proteins_with_gt, :]
+
+            gt_nz_rows, gt_nz_cols = np.nonzero(gt_with_annots)
+            if gt_nz_rows.size:
+                if not full_toi:
+                    keep = toi_mask[gt_nz_cols]
+                    gt_nz_rows = gt_nz_rows[keep]
+                    gt_nz_cols = gt_nz_cols[keep]
+                keep = ~excluded_mask[gt_nz_rows, gt_nz_cols]
+                gt_nz_rows = gt_nz_rows[keep]
+                gt_nz_cols = gt_nz_cols[keep]
+
+            n_prot_with_gt = gt_with_annots.shape[0]
+            if ic_arr is None:
+                n_gt = np.bincount(gt_nz_rows, minlength=n_prot_with_gt).astype(np.float64)
+            else:
+                n_gt = np.bincount(
+                    gt_nz_rows, weights=ic_arr[gt_nz_cols], minlength=n_prot_with_gt
+                ).astype(np.float64)
+            warn_empty_post_exclusion_gt(n_gt, ic_arr)
+
+            metrics_arr, metrics_B_tau, _eligible_rows = compute_confusion_matrix_exclude_sparse(
+                tau_arr, pred_sub, gt_with_annots, toi_mask, excluded_mask, n_gt, ic_arr, B_ind=B_ind
+            )
+            metrics = pd.DataFrame(metrics_arr, columns=columns)
+            if metrics_B_tau:
+                metrics_B = get_metrics_B(metrics_B_tau)
+        else:
+            toi_perprotein = [
+                np.setdiff1d(toi, gt_exclude.matrix[p, :].nonzero()[0], assume_unique=True)
+                for p in proteins_with_gt
+            ]
+            gt_perprotein = [
+                gt_with_annots[p_idx, tois]
+                for p_idx, tois in enumerate(toi_perprotein)
+            ]
+            n_gt = np.array([gpp.sum().item() for gpp in gt_perprotein])
+            if ic_arr is not None:
+                n_gt = np.array([
+                    (gpp * ic_arr[tois]).sum().item()
+                    for gpp, tois in zip(gt_perprotein, toi_perprotein)
+                ])
+            warn_empty_post_exclusion_gt(n_gt, ic_arr)
+            eligible_rows = np.array([gpp.sum().item() > 0 for gpp in gt_perprotein])
+            if issparse(pred_sub):
+                pred_sub = pred_sub.toarray()
+            arg_lists = [
+                [tau_chunk, gt_perprotein, pred_sub, toi_perprotein, n_gt, eligible_rows, ic_arr, B_ind]
+                for tau_chunk in np.array_split(tau_arr, n_cpu)
+            ]
+            with mp.Pool(processes=n_cpu) as pool:
+                results = pool.starmap(compute_confusion_matrix_exclude, arg_lists)
+            metrics = pd.DataFrame(np.concatenate([r[0] for r in results]), columns=columns)
+            for _thread, result in enumerate(results):
+                for tau, metrics_b in result[1].items():
+                    metrics_B_tau[tau] = metrics_b
+            if metrics_B_tau:
                 metrics_B = get_metrics_B(metrics_B_tau)
 
-    print("Jobs on all CPUs completed.")
     return metrics, metrics_B
 
 
-def make_bootstrap_indices(n_rows, B=0, B_pct=0):
+def make_bootstrap_indices(n_rows, B=0, B_pct=0, rng=None):
     """
     Generate bootstrap indices in the row space used by compute_metrics().
 
@@ -374,10 +461,42 @@ def make_bootstrap_indices(n_rows, B=0, B_pct=0):
     """
     B_ind = []
     if B and B_pct > 0:
+        rng = random if rng is None else rng
         nB = round((B_pct / 100) * n_rows)
         for b in range(B):
-            B_ind.append(random.choices(range(0, n_rows), k=nB))
+            B_ind.append(rng.choices(range(0, n_rows), k=nB))
     return B_ind
+
+
+def make_paired_bootstrap_indices(gt, ontologies, gt_exclude=None, B=0, B_pct=0, rng=None):
+    """
+    Generate bootstrap replicate indices once per namespace and metric mode.
+
+    Replicate b then refers to the same resampled target rows for every
+    prediction file. Weighted metrics get their own row space when IA filtering
+    changes the eligible target set.
+    """
+    paired_indices = {}
+    for ns in gt:
+        unweighted_rows = _proteins_with_gt(gt[ns].matrix, ontologies[ns].toi)
+        unweighted_B_ind = make_bootstrap_indices(len(unweighted_rows), B, B_pct, rng=rng)
+        paired_indices[ns] = {
+            'unweighted': unweighted_B_ind,
+            'weighted': [],
+        }
+
+        if ontologies[ns].ia is None:
+            continue
+
+        weighted_rows = _proteins_with_gt(gt[ns].matrix, ontologies[ns].toi_ia)
+        # Matching lengths is not enough: integer row positions must refer to
+        # the same proteins before unweighted draws can be reused.
+        if np.array_equal(weighted_rows, unweighted_rows):
+            paired_indices[ns]['weighted'] = unweighted_B_ind
+        else:
+            paired_indices[ns]['weighted'] = make_bootstrap_indices(len(weighted_rows), B, B_pct, rng=rng)
+
+    return paired_indices
 
 
 def normalize(metrics, ns, tau_arr, ne, normalization):
@@ -427,35 +546,36 @@ def normalize(metrics, ns, tau_arr, ne, normalization):
     return metrics
 
 
-def evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude=None, normalization='cafa', n_cpu=0, B = 0, B_pct = 0):
+def evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude=None,
+                        normalization='cafa', n_cpu=0, B=0, B_pct=0,
+                        bootstrap_indices=None):
 
     dfs = []
     dfs_w = []
     metrics_B_dfs = []
     metrics_B_w_dfs = []
+    paired_bootstrap = bootstrap_indices is not None
 
     # Unweighted metrics
     for ns in prediction:
         # number of proteins with positive annotations
-        proteins_has_gt = gt[ns].matrix[:, ontologies[ns].toi].sum(1) > 0
-        proteins_with_gt = np.where(proteins_has_gt)[0]
-        num_annot_prots = proteins_has_gt.sum()  # number of proteins with positive annotations in TOIs
+        proteins_with_gt = _proteins_with_gt(gt[ns].matrix, ontologies[ns].toi)
         if gt_exclude is None:
             exclude = None
         else:
             exclude = gt_exclude[ns]
-            toi_perprotein = [
-                np.setdiff1d(ontologies[ns].toi, gt_exclude[ns].matrix[p, :].nonzero()[0],
-                             assume_unique=True) for p in proteins_with_gt]
-            # update the number of proteins with positive annotations, now on protein-specific TOIs
-            num_annot_prots = sum([gt[ns].matrix[p, toi_perprotein[p_idx]].sum()>0 for
-                                   p_idx, p in enumerate(proteins_with_gt)])
+        num_annot_prots = count_proteins_in_toi(
+            gt[ns].matrix, ontologies[ns].toi, exclude.matrix if exclude is not None else None
+        )
 
         ne = np.full(len(tau_arr), num_annot_prots)
 
         # Generate B sets of indices in the filtered metric-row space.
         unweighted_bootstrap_n_rows = len(proteins_with_gt)
-        B_ind = make_bootstrap_indices(unweighted_bootstrap_n_rows, B, B_pct)
+        if paired_bootstrap:
+            B_ind = bootstrap_indices.get(ns, {}).get('unweighted', [])
+        else:
+            B_ind = make_bootstrap_indices(unweighted_bootstrap_n_rows, B, B_pct)
 
         metrics, metrics_B = compute_metrics(prediction[ns].matrix, gt[ns].matrix, tau_arr, ontologies[ns].toi, exclude, None, n_cpu, B_ind = B_ind)
         dfs.append(normalize(metrics, ns, tau_arr, ne, normalization))
@@ -470,23 +590,20 @@ def evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude=None, no
         # Weighted metrics
         if ontologies[ns].ia is not None:
             # number of proteins with positive annotations
-            proteins_has_gt = gt[ns].matrix[:, ontologies[ns].toi_ia].sum(1) > 0
-            proteins_with_gt = np.where(proteins_has_gt)[0]
-            num_annot_prots = (proteins_has_gt).sum()
+            proteins_with_gt = _proteins_with_gt(gt[ns].matrix, ontologies[ns].toi_ia)
 
             if gt_exclude is None:
                 exclude = None
             else:
                 exclude = gt_exclude[ns]
-                toi_perprotein_ia = [
-                    np.setdiff1d(ontologies[ns].toi_ia, gt_exclude[ns].matrix[p, :].nonzero()[0],
-                                 assume_unique=True) for p in proteins_with_gt]
-                # update the number of proteins with positive annotations, now on protein-specific TOIs
-                num_annot_prots = sum([gt[ns].matrix[p, toi_perprotein_ia[p_idx]].sum() > 0 for
-                                       p_idx, p in enumerate(proteins_with_gt)])
+            num_annot_prots = count_proteins_in_toi(
+                gt[ns].matrix, ontologies[ns].toi_ia, exclude.matrix if exclude is not None else None
+            )
 
             ne = np.full(len(tau_arr), num_annot_prots)
-            if len(proteins_with_gt) == unweighted_bootstrap_n_rows:
+            if paired_bootstrap:
+                B_ind_w = bootstrap_indices.get(ns, {}).get('weighted', [])
+            elif len(proteins_with_gt) == unweighted_bootstrap_n_rows:
                 B_ind_w = B_ind
             else:
                 B_ind_w = make_bootstrap_indices(len(proteins_with_gt), B, B_pct)
@@ -533,6 +650,9 @@ def cafa_eval(obo_file, pred_dir, gt_file, ia=None, no_orphans=False, norm='cafa
         gt_exclude = gt_exclude_parser(exclude, gt, ontologies)
     else:
         gt_exclude = None
+    bootstrap_indices = None
+    if use_paired_bootstrap():
+        bootstrap_indices = make_paired_bootstrap_indices(gt, ontologies, gt_exclude, B, B_pct)
 
     # Set prediction files looking recursively in the prediction folder
     pred_folder = os.path.normpath(pred_dir) + "/"  # add the tailing "/"
@@ -552,7 +672,8 @@ def cafa_eval(obo_file, pred_dir, gt_file, ia=None, no_orphans=False, norm='cafa
             logging.warning("Prediction: {}, not evaluated".format(file_name))
         else:
             df_pred, metrics_B_df_pred = evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude,
-                                          normalization=norm, n_cpu=n_cpu, B = B, B_pct= B_pct)
+                                          normalization=norm, n_cpu=n_cpu, B = B, B_pct= B_pct,
+                                          bootstrap_indices=bootstrap_indices)
             df_pred['filename'] = file_name.replace(pred_folder, '').replace('/', '_')
             dfs.append(df_pred)
             if isinstance(metrics_B_df_pred, pd.DataFrame):

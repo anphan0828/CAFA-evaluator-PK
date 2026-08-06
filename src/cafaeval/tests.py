@@ -1,5 +1,7 @@
 import numpy as np
 
+__test__ = False
+
 
 def test_norm_metric(metric, name=None):
     """

@@ -24,7 +24,12 @@ dependencies = [
     'pandas',
     'matplotlib',
     'numpy',
+    'scipy',
 ]
+
+[project.optional-dependencies]
+fast = ['pyarrow>=12']
+test = ['pytest>=7']
 
 [project.urls]
 Homepage = "https://github.com/BioComputingUP/CAFA-evaluator"

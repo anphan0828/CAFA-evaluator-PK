@@ -1,21 +1,46 @@
 import unittest
+import os
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
 
 from cafaeval.evaluation import (
     bootstrap,
+    compute_metrics,
     compute_confusion_matrix_exclude,
     get_bootstrap_test_indices,
     get_metrics_B,
+    make_paired_bootstrap_indices as evaluation_make_paired_bootstrap_indices,
     normalize,
+    use_paired_bootstrap,
 )
 from cafaeval.evaluation_bootstrap import make_paired_bootstrap_indices
-from cafaeval.tests import test_bootstrap_metrics
+from cafaeval.tests import test_bootstrap_metrics as _test_bootstrap_metrics
 
 
 class BootstrapCoverageTests(unittest.TestCase):
+
+    def test_paired_bootstrap_env_gate_defaults_on(self):
+        old_paired = os.environ.get("PAIRED_BOOTSTRAP")
+        try:
+            os.environ.pop("PAIRED_BOOTSTRAP", None)
+            self.assertTrue(use_paired_bootstrap())
+            os.environ["PAIRED_BOOTSTRAP"] = "0"
+            self.assertFalse(use_paired_bootstrap())
+            os.environ["PAIRED_BOOTSTRAP"] = "false"
+            self.assertFalse(use_paired_bootstrap())
+            os.environ["PAIRED_BOOTSTRAP"] = "1"
+            self.assertTrue(use_paired_bootstrap())
+        finally:
+            if old_paired is None:
+                os.environ.pop("PAIRED_BOOTSTRAP", None)
+            else:
+                os.environ["PAIRED_BOOTSTRAP"] = old_paired
+
+    def test_evaluation_bootstrap_reexports_optimized_paired_helper(self):
+        self.assertIs(make_paired_bootstrap_indices, evaluation_make_paired_bootstrap_indices)
 
     def test_bootstrap_runtime_checks_use_ten_percent_of_indices(self):
         B_ind = [[i] for i in range(20)]
@@ -99,8 +124,8 @@ class BootstrapCoverageTests(unittest.TestCase):
             metrics_b[1],
             np.array([2.0, 2.0, 2.0, 0.0, 1.0, 2.0, 2.0]),
         )
-        test_bootstrap_metrics(metrics_b[0], metrics_per_protein.iloc[[0, 1, 2]], True)
-        test_bootstrap_metrics(metrics_b[1], metrics_per_protein.iloc[[0, 0]], True)
+        _test_bootstrap_metrics(metrics_b[0], metrics_per_protein.iloc[[0, 1, 2]], True)
+        _test_bootstrap_metrics(metrics_b[1], metrics_per_protein.iloc[[0, 0]], True)
 
     def test_normalize_uses_bootstrap_denominator_for_gt_normalized_metrics(self):
         metrics = pd.DataFrame(
@@ -147,6 +172,48 @@ class BootstrapCoverageTests(unittest.TestCase):
         metrics_b = get_metrics_B(metrics_b_tau)[0]
         normalized_b = normalize(metrics_b, "biological_process", tau_arr, np.array([1.0]), "cafa")
         self.assertEqual(normalized_b.loc[0, "cov"], 1.0)
+
+    def test_sparse_and_dense_partial_knowledge_bootstrap_match(self):
+        old_sparse = os.environ.get("CAFAEVAL_SPARSE")
+        gt_matrix = np.array([
+            [True, False, True, False],
+            [True, True, False, False],
+            [False, False, False, True],
+        ])
+        exclude_matrix = np.array([
+            [True, False, False, False],
+            [True, True, False, False],
+            [False, False, False, False],
+        ])
+        pred = np.array([
+            [0.9, 0.0, 0.8, 0.4],
+            [0.2, 0.7, 0.9, 0.3],
+            [0.0, 0.0, 0.5, 0.95],
+        ])
+        exclude = SimpleNamespace(matrix=exclude_matrix)
+        tau_arr = np.array([0.25, 0.75])
+        toi = np.arange(gt_matrix.shape[1])
+        B_ind = [[0, 1, 2], [0, 0, 1]]
+
+        try:
+            os.environ["CAFAEVAL_SPARSE"] = "1"
+            metrics_sparse, boot_sparse = compute_metrics(
+                csr_matrix(pred), gt_matrix, tau_arr, toi, exclude, None, n_cpu=1, B_ind=B_ind
+            )
+            os.environ["CAFAEVAL_SPARSE"] = "0"
+            metrics_dense, boot_dense = compute_metrics(
+                csr_matrix(pred), gt_matrix, tau_arr, toi, exclude, None, n_cpu=1, B_ind=B_ind
+            )
+        finally:
+            if old_sparse is None:
+                os.environ.pop("CAFAEVAL_SPARSE", None)
+            else:
+                os.environ["CAFAEVAL_SPARSE"] = old_sparse
+
+        pd.testing.assert_frame_equal(metrics_sparse, metrics_dense)
+        self.assertEqual(set(boot_sparse), set(boot_dense))
+        for b in boot_sparse:
+            pd.testing.assert_frame_equal(boot_sparse[b], boot_dense[b])
 
 
 if __name__ == "__main__":
