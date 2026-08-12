@@ -1,0 +1,91 @@
+CAFA-evaluator-PK
+=================
+
+This repository is a fork in the CAFA-evaluator line and carries code written
+by several authors. The chain is:
+
+    CAFA-evaluator-PK (this fork)
+        |
+        +-- forked from CAFA-evaluator-PK (Clara De Paolis)
+        |       +-- derived from CAFA-evaluator (BioComputing UP, Padua)
+        |
+        +-- sparse evaluation ported from cafaeval-protea
+                (Francisco Miguel Pérez Canales)
+                    +-- which carries the speedups of
+                        CAFA-evaluator-PK-speedup (Antonina Dolgorukova)
+
+All components are distributed under the GNU General Public License version 3
+or later. The full license text is in LICENCE.md. Modifications are listed
+with their dates in CHANGELOG.md, per GPLv3 section 5(a).
+
+
+Original upstream
+-----------------
+
+CAFA-evaluator
+    Copyright (C) 2022 Damiano Piovesan
+    https://github.com/BioComputingUP/CAFA-evaluator
+
+    Piovesan D., Zago D., Joshi P., De Paolis Kaluza M. C., Mehdiabadi M.,
+    Ramola R., Monzon A. M., Reade W., Friedberg I., Radivojac P.,
+    Tosatto S. C. E. "CAFA-evaluator: A Python Tool for Benchmarking
+    Ontological Classification Methods." Bioinformatics Advances, 2024.
+    DOI: 10.1093/bioadv/vbae043
+
+    This is the primary reference for anything built on this code.
+
+
+Partial-knowledge evaluation
+----------------------------
+
+CAFA-evaluator-PK
+    Clara De Paolis
+    https://github.com/claradepaolis/CAFA-evaluator-PK
+
+    Adds partial-knowledge evaluation (per-protein exclusion of annotations
+    known at prediction time) and the terms-of-interest filter. This
+    repository is a fork of that work.
+
+
+Bootstrap resampling
+--------------------
+
+    Rashika Ramola introduced the bootstrap machinery in this line, including
+    the replicate index handling (`B_ind`) and the per-replicate metric
+    aggregation, in commits from 2025-02 onward.
+
+    An Phan extended it to paired sampling across prediction files, so that a
+    given replicate uses the same resampled targets for every method, and
+    added `src/cafaeval/evaluation_bootstrap.py`.
+
+
+Sparse evaluation
+-----------------
+
+cafaeval-protea
+    Francisco Miguel Pérez Canales
+    https://github.com/frapercan/cafaeval-protea
+
+    Source of the sparse evaluation layer integrated here in August 2026:
+    CSR storage for predictions, the sparse ontology DAG, the sparse NK/LK
+    and PK confusion-matrix kernels, sparse and COO propagation, the
+    PyArrow prediction parser, the `CAFAEVAL_SPARSE` and
+    `CAFAEVAL_FAST_PARSER` environment gates, and the partial-knowledge
+    coverage fix that restricts the coverage numerator to the
+    post-exclusion population.
+
+
+Parallel propagation
+--------------------
+
+CAFA-evaluator-PK-speedup
+    Antonina Dolgorukova (GitHub: T0chka)
+    https://github.com/T0chka/CAFA-evaluator-PK-speedup (branch speedup-local)
+
+    Shared in the CAFA 6 Kaggle discussion "Speeding up cafaeval":
+    https://www.kaggle.com/competitions/cafa-6-protein-function-prediction/discussion/664359
+
+    The shared-memory parallel DAG propagation in graph.py, the cached
+    per-term children map and the serial propagation helper originate in this
+    work. They reached this repository through cafaeval-protea, which
+    cherry-picked her commits with git authorship preserved.

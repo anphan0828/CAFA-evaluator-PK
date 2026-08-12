@@ -10,12 +10,26 @@ All notable changes to this project will be documented in this file.
   The evaluator now uses the same post-exclusion eligible protein population
   for the coverage numerator and denominator, including the IA-weighted
   setting. See `example/README.md` for the toy reproduction and expected
-  corrected output.
+  corrected output. The same fix, with the same post-exclusion eligibility
+  predicate, is recorded in `cafaeval-protea` as commit `cec8ccd` dated
+  2026-04-23 and documented in `CHANGES.md` there.
 - 2026-08-04: integrated the sparse optimization strategy from
-  `cafaeval-protea` into CAFA-evaluator-PK while preserving the committed
-  bootstrap API and CLI. Source commits include protea `52acad7`
+  `cafaeval-protea` (Francisco Miguel Pérez Canales,
+  https://github.com/frapercan/cafaeval-protea) into CAFA-evaluator-PK while
+  preserving the committed bootstrap API and CLI. Source commits include
+  protea `52acad7`
   (`perf: bring sparse eval (CSR storage + sparse GO DAG) to main`) and
   `80d705a` (`fix(graph): propagation fill bit-parity to main`).
+- The shared-memory parallel DAG propagation that arrived with that port, the
+  cached per-term children map and the serial propagation helper in
+  `graph.py`, originate in CAFA-evaluator-PK-speedup by Antonina Dolgorukova
+  (https://github.com/T0chka/CAFA-evaluator-PK-speedup), shared in the CAFA 6
+  Kaggle discussion "Speeding up cafaeval". They reached this repository
+  through `cafaeval-protea`, which cherry-picked her commits with git
+  authorship preserved.
+- Added `NOTICE` recording the full attribution chain for this line, from the
+  original CAFA-evaluator through the partial-knowledge fork, the bootstrap
+  work and the sparse port.
 - Added `src/cafaeval/sparse.py` as the shared sparse helper module for
   environment gates, CSR non-zero extraction, sparse NK/LK and PK metric
   kernels, bootstrap-aware sparse metric aggregation, sparse propagation,
