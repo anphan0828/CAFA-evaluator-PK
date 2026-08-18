@@ -3,9 +3,12 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import issparse
+from scipy.sparse import csr_matrix, issparse
 
 from cafaeval.tests import test_bootstrap_metrics
+
+
+DEFAULT_BOOTSTRAP_THRESHOLD_CHUNK_SIZE = 64
 
 
 def use_sparse():
@@ -14,6 +17,23 @@ def use_sparse():
 
 def use_fast_parser():
     return os.environ.get("CAFAEVAL_FAST_PARSER", "1") not in ("0", "false", "False")
+
+
+def use_bootstrap_checks():
+    return os.environ.get("CAFAEVAL_BOOTSTRAP_CHECKS", "0") == "1"
+
+
+def bootstrap_threshold_chunk_size():
+    raw_chunk_size = os.environ.get("CAFAEVAL_BOOTSTRAP_CHUNK_SIZE")
+    if raw_chunk_size is None:
+        return DEFAULT_BOOTSTRAP_THRESHOLD_CHUNK_SIZE
+    try:
+        chunk_size = int(raw_chunk_size)
+    except ValueError as exc:
+        raise ValueError("CAFAEVAL_BOOTSTRAP_CHUNK_SIZE must be a positive integer") from exc
+    if chunk_size <= 0:
+        raise ValueError("CAFAEVAL_BOOTSTRAP_CHUNK_SIZE must be a positive integer")
+    return chunk_size
 
 
 def csr_nonzeros(mat):
@@ -65,55 +85,137 @@ def _bootstrap_from_arrays(tau_arr, n_pred_at_tau, tp_at_tau, n_gt, B_ind, eligi
     if has_eligibility:
         eligible_rows = np.asarray(eligible_rows, dtype=bool)
 
-    test_indices = _bootstrap_test_indices(B_ind)
+    n_pred_at_tau = np.asarray(n_pred_at_tau, dtype=np.float64)
+    tp_at_tau = np.asarray(tp_at_tau, dtype=np.float64)
     n_gt = np.asarray(n_gt, dtype="float")
-    for t_idx, tau in enumerate(tau_arr):
-        n_pred = n_pred_at_tau[:, t_idx]
-        tp = tp_at_tau[:, t_idx]
-        fp = n_pred - tp
-        fn = n_gt - tp
-        metrics_B = np.zeros((len(B_ind), 7), dtype="float")
-        for b, ind in enumerate(B_ind):
-            ind = np.asarray(ind, dtype=np.int64)
-            n_pred_b = n_pred[ind]
-            tp_b = tp[ind]
-            fp_b = fp[ind]
-            fn_b = fn[ind]
-            n_gt_b = n_gt[ind]
 
-            if has_eligibility:
-                eligible_b = eligible_rows[ind]
-                metrics_B[b, 0] = ((n_pred_b > 0) & eligible_b).sum()
-                metrics_B[b, 6] = eligible_b.sum()
-            else:
-                metrics_B[b, 0] = (n_pred_b > 0).sum()
-                metrics_B[b, 6] = len(n_pred_b)
+    n_rows = n_pred_at_tau.shape[0]
+    if tp_at_tau.shape != n_pred_at_tau.shape:
+        raise ValueError("tp_at_tau and n_pred_at_tau must have the same shape")
+    if n_gt.shape[0] != n_rows:
+        raise ValueError("n_gt length must match bootstrap row count")
+    if has_eligibility and eligible_rows.shape[0] != n_rows:
+        raise ValueError("eligible_rows length must match bootstrap row count")
 
-            metrics_B[b, 1] = tp_b.sum()
-            metrics_B[b, 2] = fp_b.sum()
-            metrics_B[b, 3] = fn_b.sum()
-            metrics_B[b, 4] = np.divide(
-                tp_b, n_pred_b, out=np.zeros_like(tp_b, dtype="float"), where=n_pred_b > 0
-            ).sum()
-            metrics_B[b, 5] = np.divide(
-                tp_b, n_gt_b, out=np.zeros_like(n_gt_b, dtype="float"), where=n_gt_b > 0
-            ).sum()
+    count_matrix = _bootstrap_count_matrix(B_ind, n_rows)
+    n_boot = count_matrix.shape[0]
+    for tau in tau_arr:
+        metrics_B_tau[tau] = np.zeros((n_boot, 7), dtype="float")
+    if n_boot == 0:
+        return metrics_B_tau
 
-            if b in test_indices:
-                metrics_per_protein_b = pd.DataFrame({
-                    "n_pred": n_pred_b,
-                    "TP": tp_b,
-                    "FP": fp_b,
-                    "FN": fn_b,
-                    "n_gt": n_gt_b,
-                })
-                if has_eligibility:
-                    metrics_per_protein_b["eligible"] = eligible_b
-                test_bootstrap_metrics(metrics_B[b], metrics_per_protein_b, has_eligibility)
+    sample_counts = np.asarray(count_matrix.sum(axis=1)).ravel()
+    if has_eligibility:
+        n_eval = np.asarray(count_matrix @ eligible_rows.astype(np.float64, copy=False)).ravel()
+    else:
+        n_eval = sample_counts
 
-        metrics_B_tau[tau] = metrics_B
+    n_gt_col = n_gt[:, None]
+    chunk_size = bootstrap_threshold_chunk_size()
+    for chunk_start in range(0, len(tau_arr), chunk_size):
+        chunk_end = min(len(tau_arr), chunk_start + chunk_size)
+        n_pred_chunk = n_pred_at_tau[:, chunk_start:chunk_end]
+        tp_chunk = tp_at_tau[:, chunk_start:chunk_end]
+
+        covered = n_pred_chunk > 0
+        if has_eligibility:
+            covered = covered & eligible_rows[:, None]
+        n_B = count_matrix @ covered.astype(np.float64, copy=False)
+        tp_B = count_matrix @ tp_chunk
+        fp_B = count_matrix @ (n_pred_chunk - tp_chunk)
+        fn_B = count_matrix @ (n_gt_col - tp_chunk)
+
+        pr_contrib = np.divide(
+            tp_chunk,
+            n_pred_chunk,
+            out=np.zeros_like(tp_chunk, dtype="float"),
+            where=n_pred_chunk > 0,
+        )
+        rc_contrib = np.divide(
+            tp_chunk,
+            n_gt_col,
+            out=np.zeros_like(tp_chunk, dtype="float"),
+            where=n_gt_col > 0,
+        )
+        pr_B = count_matrix @ pr_contrib
+        rc_B = count_matrix @ rc_contrib
+
+        for offset, tau in enumerate(tau_arr[chunk_start:chunk_end]):
+            metrics_B = metrics_B_tau[tau]
+            metrics_B[:, 0] = n_B[:, offset]
+            metrics_B[:, 1] = tp_B[:, offset]
+            metrics_B[:, 2] = fp_B[:, offset]
+            metrics_B[:, 3] = fn_B[:, offset]
+            metrics_B[:, 4] = pr_B[:, offset]
+            metrics_B[:, 5] = rc_B[:, offset]
+            metrics_B[:, 6] = n_eval
+
+        if use_bootstrap_checks():
+            _validate_bootstrap_chunk(
+                tau_arr[chunk_start:chunk_end],
+                metrics_B_tau,
+                n_pred_chunk,
+                tp_chunk,
+                n_gt,
+                B_ind,
+                eligible_rows,
+            )
 
     return metrics_B_tau
+
+
+def _bootstrap_count_matrix(B_ind, n_rows):
+    n_boot = len(B_ind)
+    if n_boot == 0:
+        return csr_matrix((0, n_rows), dtype=np.float64)
+
+    lengths = np.fromiter((len(ind) for ind in B_ind), dtype=np.int64, count=n_boot)
+    n_samples = int(lengths.sum())
+    if n_samples == 0:
+        return csr_matrix((n_boot, n_rows), dtype=np.float64)
+
+    cols = np.concatenate([np.asarray(ind, dtype=np.int64) for ind in B_ind if len(ind)])
+    if cols.min() < 0 or cols.max() >= n_rows:
+        raise IndexError("bootstrap row index out of bounds for metric row space")
+    rows = np.repeat(np.arange(n_boot, dtype=np.int64), lengths)
+    data = np.ones(n_samples, dtype=np.float64)
+    return csr_matrix((data, (rows, cols)), shape=(n_boot, n_rows), dtype=np.float64)
+
+
+def _validate_bootstrap_chunk(
+    tau_chunk,
+    metrics_B_tau,
+    n_pred_chunk,
+    tp_chunk,
+    n_gt,
+    B_ind,
+    eligible_rows=None,
+):
+    has_eligibility = eligible_rows is not None
+    test_indices = _bootstrap_test_indices(B_ind)
+    if not test_indices:
+        return
+
+    if has_eligibility:
+        eligible_rows = np.asarray(eligible_rows, dtype=bool)
+
+    for t_idx, tau in enumerate(tau_chunk):
+        n_pred = n_pred_chunk[:, t_idx]
+        tp = tp_chunk[:, t_idx]
+        fp = n_pred - tp
+        fn = n_gt - tp
+        for b in test_indices:
+            ind = np.asarray(B_ind[b], dtype=np.int64)
+            metrics_per_protein_b = pd.DataFrame({
+                "n_pred": n_pred[ind],
+                "TP": tp[ind],
+                "FP": fp[ind],
+                "FN": fn[ind],
+                "n_gt": n_gt[ind],
+            })
+            if has_eligibility:
+                metrics_per_protein_b["eligible"] = eligible_rows[ind]
+            test_bootstrap_metrics(metrics_B_tau[tau][b], metrics_per_protein_b, has_eligibility)
 
 
 def _bootstrap_test_indices(B_ind):

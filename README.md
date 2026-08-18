@@ -108,6 +108,10 @@ PAIRED_BOOTSTRAP=0 python3 /path/to/CAFA-evaluator/src/cafaeval/__main__.py onto
 ```
 
 Both paired and non-paired modes use the same sparse evaluator and parser paths.
+In the default sparse path, bootstrap aggregation is vectorized over a sparse
+bootstrap count matrix and processed in threshold chunks to limit peak memory.
+Set `CAFAEVAL_BOOTSTRAP_CHECKS=1` to enable extra runtime validation on a
+deterministic subset of bootstrap replicates during debugging.
 
 ### Command line
 

@@ -49,6 +49,11 @@ All notable changes to this project will be documented in this file.
   per-prediction-file bootstrap sampling. `evaluation_bootstrap.py` is now a
   compatibility wrapper over the optimized `evaluation.py` implementation, so
   paired and non-paired modes use the same sparse metric and parser paths.
+- 2026-08-06: vectorized sparse bootstrap aggregation by converting `B_ind`
+  row samples to CSR count matrices and processing threshold chunks. This
+  preserves paired and non-paired bootstrap semantics, keeps dense fallback
+  unchanged, and gates expensive runtime bootstrap validation behind
+  `CAFAEVAL_BOOTSTRAP_CHECKS=1`.
 
 ## [1.2.1] - 2024-03-26
 - Minor bugfix affecting multi-thread calculation. 

@@ -657,9 +657,12 @@ def cafa_eval(obo_file, pred_dir, gt_file, ia=None, no_orphans=False, norm='cafa
     # Set prediction files looking recursively in the prediction folder
     pred_folder = os.path.normpath(pred_dir) + "/"  # add the tailing "/"
     pred_files = []
-    for root, dirs, files in os.walk(pred_folder):
-        for file in files:
-            pred_files.append(os.path.join(root, file))
+    # for root, dirs, files in os.walk(pred_folder):
+    #     for file in files:
+    #         pred_files.append(os.path.join(root, file))
+    for file in os.listdir(pred_folder):
+        if os.path.isfile(os.path.join(pred_folder, file)):
+            pred_files.append(os.path.join(pred_folder, file))
     logging.debug("Prediction paths {}".format(pred_files))
 
     # Parse prediction files and perform evaluation
