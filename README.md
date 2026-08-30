@@ -65,7 +65,11 @@ Example input files are provided inside the `data/example` folder.
 ### Sparse evaluation and parser acceleration
 
 This fork includes sparse evaluator optimizations ported from
-`cafaeval-protea`. `scipy` is now required because prediction matrices are
+[cafaeval-protea](https://github.com/frapercan/cafaeval-protea) by Francisco
+Miguel Pérez Canales, which in turn carries the parallel propagation speedups
+of [CAFA-evaluator-PK-speedup](https://github.com/T0chka/CAFA-evaluator-PK-speedup)
+by Antonina Dolgorukova. See `NOTICE` for the full attribution chain.
+`scipy` is now required because prediction matrices are
 stored as CSR sparse matrices after parsing and propagation. Sparse evaluation
 is enabled by default and can be disabled for debugging or parity checks:
 
