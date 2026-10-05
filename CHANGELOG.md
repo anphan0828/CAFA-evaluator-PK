@@ -16,6 +16,9 @@ All notable changes to this project will be documented in this file.
   bootstrap API and CLI. Source commits include protea `52acad7`
   (`perf: bring sparse eval (CSR storage + sparse GO DAG) to main`) and
   `80d705a` (`fix(graph): propagation fill bit-parity to main`).
+- Note: the parallel propagation in graph.py is adapted from Antonina Dolgorukova's
+  GitHub, shared CAFA 6 Kaggle discussion ["Speeding up cafaeval"](https://www.kaggle.com/competitions/cafa-6-protein-function-prediction/discussion/664359).
+  GitHub: [CAFA-evaluator-PK-speedup](https://github.com/T0chka/CAFA-evaluator-PK-speedup). Author: Antonina Dolgorukova (GitHub: T0chka).
 - Added `src/cafaeval/sparse.py` as the shared sparse helper module for
   environment gates, CSR non-zero extraction, sparse NK/LK and PK metric
   kernels, bootstrap-aware sparse metric aggregation, sparse propagation,
