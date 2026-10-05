@@ -722,6 +722,10 @@ def write_results(df, dfs_best, metrics_B_df, out_dir='results', th_step=0.01):
     if not os.path.isdir(out_folder):
         os.makedirs(out_folder)
 
+    if df is None:
+        logging.warning("No predictions evaluated; no result tables written to {}".format(out_folder))
+        return
+
     # Set the number of decimals to write in the output files based on the threshold step size
     decimals = int(np.ceil(-np.log10(th_step))) + 1
 

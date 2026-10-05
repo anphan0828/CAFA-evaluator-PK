@@ -178,32 +178,66 @@ def _split_prediction_line(line):
     return line.strip().split()
 
 
+def _log_prediction_skip(pred_file, line_no, reason, row, skipped):
+    skipped[reason] = skipped.get(reason, 0) + 1
+    if skipped[reason] <= 5:
+        logging.warning(
+            "Prediction: {}, skipping malformed row {}: {}; row={!r}".format(
+                pred_file, line_no, reason, row
+            )
+        )
+
+
+def _log_prediction_skip_summary(pred_file, skipped):
+    if skipped:
+        summary = ", ".join(
+            "{} {}".format(count, reason) for reason, count in sorted(skipped.items())
+        )
+        logging.warning("Prediction: {}, skipped malformed rows: {}".format(pred_file, summary))
+
+
 def _pred_parser_legacy(pred_file, ontologies, gts, ns_dict, term_index, ids,
                         matrix, row_nnz, replaced, max_terms):
+    skipped = {}
     with open(pred_file, buffering=1024 * 1024) as f:
-        for line in f:
-            line = _split_prediction_line(line)
-            if line and len(line) > 2:
-                p_id, term_id, prob = line[:3]
-                ns = ns_dict.get(term_id)
-                if ns in gts and p_id in gts[ns].ids:
-                    i = gts[ns].ids[p_id]
-                    term_ids = [term_id]
-                    if term_id in ontologies[ns].terms_dict_alt:
-                        term_ids = ontologies[ns].terms_dict_alt[term_id]
-                        replaced.setdefault(ns, 0)
-                        replaced[ns] += len(term_ids)
-                    for term_id in term_ids:
-                        j = term_index[ns].get(term_id)
-                        old = matrix[ns][i, j]
-                        if max_terms is not None and old == 0.0 and row_nnz[ns][i] > max_terms:
-                            continue
-                        prob_f = float(prob)
-                        if prob_f > old:
-                            ids[ns][p_id] = i
-                            matrix[ns][i, j] = prob_f
-                            if old == 0.0:
-                                row_nnz[ns][i] += 1
+        for line_no, raw_line in enumerate(f, start=1):
+            line = _split_prediction_line(raw_line)
+            if not line:
+                continue
+            if len(line) != 3:
+                _log_prediction_skip(
+                    pred_file, line_no, "wrong number of fields", raw_line.rstrip("\n"), skipped
+                )
+                continue
+
+            p_id, term_id, prob = line
+            try:
+                prob_f = float(prob)
+            except ValueError:
+                _log_prediction_skip(
+                    pred_file, line_no, "invalid score", raw_line.rstrip("\n"), skipped
+                )
+                continue
+
+            ns = ns_dict.get(term_id)
+            if ns in gts and p_id in gts[ns].ids:
+                i = gts[ns].ids[p_id]
+                term_ids = [term_id]
+                if term_id in ontologies[ns].terms_dict_alt:
+                    term_ids = ontologies[ns].terms_dict_alt[term_id]
+                    replaced.setdefault(ns, 0)
+                    replaced[ns] += len(term_ids)
+                for term_id in term_ids:
+                    j = term_index[ns].get(term_id)
+                    old = matrix[ns][i, j]
+                    if max_terms is not None and old == 0.0 and row_nnz[ns][i] > max_terms:
+                        continue
+                    if prob_f > old:
+                        ids[ns][p_id] = i
+                        matrix[ns][i, j] = prob_f
+                        if old == 0.0:
+                            row_nnz[ns][i] += 1
+    _log_prediction_skip_summary(pred_file, skipped)
 
 
 def _detect_pred_delimiter(pred_file, max_lines=64, max_bytes=1024 * 1024):
